@@ -196,7 +196,7 @@ func (r *connectionStatsChartRenderer) MinSize() fyne.Size {
 	}
 
 	labelWidth := float32(math.Max(float64(r.yLabelMax.MinSize().Width), float64(r.yLabelMin.MinSize().Width)))
-	minChartAreaHeight := theme.TextSize() * 3 // Minimum space for chart itself
+	minChartAreaHeight := theme.TextSize() * 15 // Minimum space for chart itself
 	minChartAreaWidth := float32(50)            // Minimum pixel width for the data area
 
 	minHeight := titleMinHeight + r.yLabelMax.MinSize().Height + r.yLabelMin.MinSize().Height + minChartAreaHeight + theme.Padding()*4
