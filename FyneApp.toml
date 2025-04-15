@@ -1,0 +1,6 @@
+[Details]
+  Icon = "icon.png"
+  Name = "My Fyne App"
+  ID = "com.example.myfyneapp"
+  Version = "1.0.0"
+  Build = 2
