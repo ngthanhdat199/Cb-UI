@@ -29,7 +29,7 @@ var mainWindow fyne.Window
 // =====================================================
 
 const (
-	minZoom         = 0
+	minZoom         = 7
 	maxZoom         = 18
 	mapTileSize     = 256
 	tileResultBuf   = 64
@@ -836,9 +836,9 @@ func createLoggedInScreen() fyne.CanvasObject {
 		layout.NewSpacer(),
 	)
 
-	mapStartZoom := 4
-	mapStartLat := 20.0
-	mapStartLon := 60.0
+	mapStartZoom := 12
+	mapStartLat := gateways[0].lat
+	mapStartLon := gateways[0].lon
 
 	mapWidget := NewTileMapWidget(mapStartZoom, mapStartLat, mapStartLon, mainWindow)
 	mapWidget.AddMarkers(gatewayMarkers...)
