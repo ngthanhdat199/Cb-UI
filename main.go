@@ -38,12 +38,15 @@ const (
 	markerHitRadius = 10.0
 	fetchTimeout    = 15 * time.Second
 	sendTimeout     = 5 * time.Second
+
+	mapboxUsername    = "thanhdat19"
+	mapboxStyleID     = "cm9is30la00sx01qua6xa2b7s"
+	mapboxAccessToken = "pk.eyJ1IjoidGhhbmhkYXQxOSIsImEiOiJjbTlpcHgycXgwMjcwMmpxMTRybXczamMwIn0.NLpIdFMutAPECag8yVaERA"
 )
 
 var (
-	cartoSubdomains = []string{"a", "b", "c", "d"}
-	mapMarkerColor  = color.NRGBA{R: 0, G: 0, B: 255, A: 255}
-	httpClient      = &http.Client{Timeout: fetchTimeout}
+	mapMarkerColor = color.NRGBA{R: 0, G: 0, B: 255, A: 255}
+	httpClient     = &http.Client{Timeout: fetchTimeout}
 )
 
 type TileCoord struct {
@@ -440,9 +443,15 @@ func (r *tileMapRenderer) fetchTileDataAsync(coord TileCoord) {
 		}
 	}()
 
-	subdomainIndex := (coord.X + coord.Y) % len(cartoSubdomains)
-	subdomain := cartoSubdomains[subdomainIndex]
-	url := fmt.Sprintf("https://%s.basemaps.cartocdn.com/rastertiles/voyager/%d/%d/%d.png", subdomain, coord.Z, coord.X, coord.Y)
+	url := fmt.Sprintf("https://api.mapbox.com/styles/v1/%s/%s/tiles/%d/%d/%d/%d?access_token=%s",
+		mapboxUsername,
+		mapboxStyleID,
+		mapTileSize,
+		coord.Z,
+		coord.X,
+		coord.Y,
+		mapboxAccessToken,
+	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 	defer cancel()
