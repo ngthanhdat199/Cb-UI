@@ -754,18 +754,6 @@ func (r *connectionStatsChartRenderer) Destroy() {}
 // Application Screens
 // =====================================================
 
-func main() {
-	a := app.New()
-	a.Settings().SetTheme(theme.DarkTheme())
-	mainWindow = a.NewWindow("Fyne App with Map")
-	loginContent := createLoginScreen()
-	mainWindow.SetContent(loginContent)
-	mainWindow.Resize(fyne.NewSize(1000, 700))
-	mainWindow.CenterOnScreen()
-	mainWindow.ShowAndRun()
-	log.Println("Application exiting.")
-}
-
 func createLoginScreen() fyne.CanvasObject {
 	userNameLabel := widget.NewLabel("John Doe")
 	topContent := container.NewHBox(layout.NewSpacer(), userNameLabel)
@@ -920,4 +908,16 @@ func createConnectedScreen(gatewayName, gatewayRegion, deviceName string) fyne.C
 		container.NewPadded(centerContent),
 	)
 	return connectedLayout
+}
+
+func main() {
+	a := app.New()
+	a.Settings().SetTheme(theme.DarkTheme())
+	mainWindow = a.NewWindow("Fyne App with Map")
+	loginContent := createLoginScreen()
+	mainWindow.SetContent(loginContent)
+	mainWindow.Resize(fyne.NewSize(1000, 700))
+	mainWindow.CenterOnScreen()
+	mainWindow.ShowAndRun()
+	log.Println("Application exiting.")
 }
