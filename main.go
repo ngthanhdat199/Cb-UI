@@ -6,10 +6,15 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"log"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -29,8 +34,9 @@ var mainWindow fyne.Window
 // =====================================================
 
 const (
+	// maxZoom         = 14
 	minZoom         = 7
-	maxZoom         = 18
+	maxZoom         = 7
 	mapTileSize     = 256
 	tileResultBuf   = 64
 	yourUserAgent   = "MyFyneMapApp/0.4 (contact@example.com)"
@@ -45,8 +51,10 @@ const (
 )
 
 var (
-	mapMarkerColor = color.NRGBA{R: 0, G: 0, B: 255, A: 255}
-	httpClient     = &http.Client{Timeout: fetchTimeout}
+	mapMarkerColor  = color.NRGBA{R: 0, G: 0, B: 255, A: 255}
+	httpClient      = &http.Client{Timeout: fetchTimeout}
+	tileCachePath   string
+	cacheWriteMutex sync.Mutex
 )
 
 type TileCoord struct {
@@ -299,12 +307,11 @@ func (r *tileMapRenderer) MinSize() fyne.Size {
 }
 
 func (r *tileMapRenderer) Refresh() {
+	r.processTileResults()
+
 	r.mapWidget.mu.RLock()
-	zoom := r.mapWidget.zoom
-	centerLat := r.mapWidget.centerLat
-	centerLon := r.mapWidget.centerLon
-	width := r.mapWidget.width
-	height := r.mapWidget.height
+	zoom, centerLat, centerLon := r.mapWidget.zoom, r.mapWidget.centerLat, r.mapWidget.centerLon
+	width, height := r.mapWidget.width, r.mapWidget.height
 	currentMarkers := make([]*MapMarker, len(r.mapWidget.markers))
 	copy(currentMarkers, r.mapWidget.markers)
 	r.mapWidget.mu.RUnlock()
@@ -321,20 +328,41 @@ func (r *tileMapRenderer) Refresh() {
 	r.mapWidget.mu.Lock()
 	for _, coord := range visibleTiles {
 		imgData, dataFound := r.mapWidget.imageDataCache[coord]
+
+		if !dataFound && tileCachePath != "" {
+			tileFilePath := getTileFilePath(coord)
+			cachedImg, err := readTileFromCache(tileFilePath)
+			if err == nil && cachedImg != nil {
+
+				imgData = cachedImg
+				r.mapWidget.imageDataCache[coord] = imgData
+				dataFound = true
+			} else if err != nil && !os.IsNotExist(err) {
+
+				log.Printf("Warning: Error reading tile cache file %s: %v", tileFilePath, err)
+
+			}
+
+		}
+
 		if dataFound {
 			canvasImg, canvasFound := r.canvasTiles[coord]
 			if !canvasFound {
 				canvasImg = canvas.NewImageFromImage(imgData)
 				if canvasImg == nil {
-					log.Printf("Error: Failed to create canvas image from cached data for tile %v", coord)
+					log.Printf("Error: Failed canvas image creation tile %v", coord)
 					delete(r.mapWidget.imageDataCache, coord)
+
+					if tileCachePath != "" {
+
+					}
 					continue
 				}
-				canvasImg.ScaleMode = canvas.ImageScaleFastest
-				canvasImg.FillMode = canvas.ImageFillOriginal
+				canvasImg.ScaleMode, canvasImg.FillMode = canvas.ImageScaleFastest, canvas.ImageFillOriginal
 				canvasImg.Resize(fyne.NewSize(mapTileSize, mapTileSize))
 				r.canvasTiles[coord] = canvasImg
 			}
+
 			posX, posY := r.calculateTilePosition(coord, zoom, centerLat, centerLon, width, height)
 			canvasImg.Move(fyne.NewPos(posX, posY))
 			canvasImg.Show()
@@ -361,18 +389,34 @@ func (r *tileMapRenderer) Refresh() {
 
 	for _, marker := range currentMarkers {
 		screenX, screenY := r.mapWidget.latLonToScreenXY(marker.Lat, marker.Lon)
+		if screenX < 0 || screenY < 0 {
+			continue
+		}
+
 		canvasObj, exists := r.canvasMarkers[marker]
 		var circle *canvas.Circle
+
 		if !exists {
+
 			circle = canvas.NewCircle(mapMarkerColor)
 			circle.Resize(fyne.NewSize(markerRadius*2, markerRadius*2))
 			r.canvasMarkers[marker] = circle
 			canvasObj = circle
 		} else {
-			circle = canvasObj.(*canvas.Circle)
+
+			var ok bool
+			circle, ok = canvasObj.(*canvas.Circle)
+			if !ok {
+				log.Printf("Error: Expected *canvas.Circle for marker %s, got %T. Recreating.", marker.Name, canvasObj)
+				delete(r.canvasMarkers, marker)
+				continue
+			}
+
 		}
+
 		circle.Move(fyne.NewPos(screenX-markerRadius, screenY-markerRadius))
 		circle.Show()
+
 		currentMarkerObjects = append(currentMarkerObjects, canvasObj)
 		activeCanvasMarkers[marker] = true
 	}
@@ -385,9 +429,79 @@ func (r *tileMapRenderer) Refresh() {
 	}
 
 	r.objects = append(currentTileObjects, currentMarkerObjects...)
+
 	for _, coord := range neededCoords {
 		go r.fetchTileDataAsync(coord)
 	}
+}
+
+func (r *tileMapRenderer) processTileResults() {
+	processed := 0
+	for {
+		select {
+		case result := <-r.mapWidget.resultChan:
+			processed++
+			r.mapWidget.mu.Lock()
+			delete(r.mapWidget.tileFetching, result.Coord)
+			if result.Error == nil && result.Image != nil {
+				if result.Image.Bounds().Dx() > 0 && result.Image.Bounds().Dy() > 0 {
+					r.mapWidget.imageDataCache[result.Coord] = result.Image
+				} else {
+					log.Printf("Warning: Received invalid image dimensions for tile %v", result.Coord)
+				}
+			} else if result.Error != nil {
+
+				errorStr := result.Error.Error()
+				isKnownNotFound := errorStr == "tile not found (404)" || errorStr == "Mapbox API Error: 404 Not Found (Check User/Style/Coords)"
+				if !isKnownNotFound {
+					log.Printf("Error processing tile result %v: %v", result.Coord, result.Error)
+				}
+
+			} else {
+				log.Printf("Warning: Received nil image and nil error for tile %v", result.Coord)
+			}
+			r.mapWidget.mu.Unlock()
+
+		default:
+			return
+		}
+	}
+}
+
+func readTileFromCache(filePath string) (image.Image, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	img, decodeErr := png.Decode(file)
+
+	if decodeErr != nil {
+		if decodeErr == io.ErrUnexpectedEOF || decodeErr.Error() == "unexpected EOF" {
+			log.Printf("Warning: Detected corrupt cache file (EOF): %s. Deleting.", filePath)
+
+			file.Close()
+			if removeErr := os.Remove(filePath); removeErr != nil {
+				log.Printf("Error: Failed to delete corrupt cache file '%s': %v", filePath, removeErr)
+			}
+
+			return nil, decodeErr
+		}
+
+		return nil, fmt.Errorf("failed to decode cached png '%s': %w", filePath, decodeErr)
+	}
+
+	if img == nil || img.Bounds().Dx() <= 0 || img.Bounds().Dy() <= 0 {
+		log.Printf("Warning: Cached image invalid (dimensions): %s. Deleting.", filePath)
+		file.Close()
+		if removeErr := os.Remove(filePath); removeErr != nil {
+			log.Printf("Error: Failed to delete invalid cache file '%s': %v", filePath, removeErr)
+		}
+		return nil, fmt.Errorf("cached image invalid '%s'", filePath)
+	}
+
+	return img, nil
 }
 
 func (r *tileMapRenderer) calculateRequiredTiles(zoom int, lat, lon float64, w, h float32) []TileCoord {
@@ -437,52 +551,50 @@ func (r *tileMapRenderer) fetchTileDataAsync(coord TileCoord) {
 			r.clearFetchingStatus(coord)
 		}
 		if rec := recover(); rec != nil {
-			log.Printf("Panic recovered in fetchTileDataAsync for %v: %v", coord, rec)
-			result.Error = fmt.Errorf("panic during fetch: %v", rec)
+			log.Printf("Panic fetch %v: %v", coord, rec)
+			result.Error = fmt.Errorf("panic: %v", rec)
 			r.sendResultNonBlocking(result)
 		}
 	}()
 
-	url := fmt.Sprintf("https://api.mapbox.com/styles/v1/%s/%s/tiles/%d/%d/%d/%d?access_token=%s",
-		mapboxUsername,
-		mapboxStyleID,
-		mapTileSize,
-		coord.Z,
-		coord.X,
-		coord.Y,
-		mapboxAccessToken,
-	)
-
 	ctx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
 	defer cancel()
+
+	url := fmt.Sprintf("https://api.mapbox.com/styles/v1/%s/%s/tiles/%d/%d/%d/%d?access_token=%s", mapboxUsername, mapboxStyleID, mapTileSize, coord.Z, coord.X, coord.Y, mapboxAccessToken)
+	fmt.Println("Fetching tile:", url) // Keep commented unless debugging
+
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		result.Error = fmt.Errorf("creating request failed: %w", err)
+		result.Error = fmt.Errorf("req fail: %w", err)
 		r.sendResult(result)
 		return
 	}
 	req.Header.Set("User-Agent", yourUserAgent)
-
 	resp, err := httpClient.Do(req)
 	if resp != nil {
 		defer resp.Body.Close()
 	}
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			result.Error = fmt.Errorf("http timeout")
+			result.Error = fmt.Errorf("timeout")
 		} else if ctx.Err() == context.Canceled {
-			result.Error = fmt.Errorf("http cancelled")
+			result.Error = fmt.Errorf("cancelled")
 		} else {
-			result.Error = fmt.Errorf("http request failed: %w", err)
+			result.Error = fmt.Errorf("http fail: %w", err)
 		}
 		r.sendResult(result)
 		return
 	}
-	if resp.StatusCode == http.StatusNotFound {
-		result.Error = fmt.Errorf("tile not found (404)")
+	if resp.StatusCode == http.StatusUnauthorized {
+		result.Error = fmt.Errorf("Mapbox API Error: %s (Check Token)", resp.Status)
 		r.sendResult(result)
 		return
 	}
+	if resp.StatusCode == http.StatusNotFound {
+		result.Error = fmt.Errorf("Mapbox API Error: %s (Check User/Style/Coords)", resp.Status)
+		r.sendResult(result)
+		return
+	} // Treat 404 as an error to not cache it
 	if resp.StatusCode != http.StatusOK {
 		result.Error = fmt.Errorf("http status %s", resp.Status)
 		r.sendResult(result)
@@ -491,19 +603,69 @@ func (r *tileMapRenderer) fetchTileDataAsync(coord TileCoord) {
 
 	imgData, err := png.Decode(resp.Body)
 	if err != nil {
-		result.Error = fmt.Errorf("decoding png failed: %w", err)
+		result.Error = fmt.Errorf("png decode fail: %w", err)
 		r.sendResult(result)
 		return
 	}
 	if imgData == nil || imgData.Bounds().Dx() <= 0 || imgData.Bounds().Dy() <= 0 {
-		result.Error = fmt.Errorf("decoded image invalid")
+		result.Error = fmt.Errorf("bad img")
 		r.sendResult(result)
 		return
 	}
 
+	// --- START Cache Write ---
+	if tileCachePath != "" { // Only write if cache path is set
+		tileFilePath := getTileFilePath(coord)
+		err := writeTileToCache(tileFilePath, imgData)
+		if err != nil {
+			log.Printf("Warning: Failed to write tile %v to cache '%s': %v", coord, tileFilePath, err)
+		} else {
+			// log.Printf("Cache WRITE: %v", coord) // For debugging
+		}
+	}
+	// --- END Cache Write ---
+
 	result.Image = imgData
 	fetchSuccessful = true
 	r.sendResult(result)
+}
+
+func writeTileToCache(filePath string, img image.Image) error {
+	cacheWriteMutex.Lock()
+	defer cacheWriteMutex.Unlock()
+
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create cache subdir '%s': %w", dir, err)
+	}
+
+	tempFile, err := os.CreateTemp(dir, "tile-*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temp cache file in '%s': %w", dir, err)
+	}
+	tempFilePath := tempFile.Name()
+
+	encodeErr := png.Encode(tempFile, img)
+
+	closeErr := tempFile.Close()
+
+	if encodeErr != nil {
+		_ = os.Remove(tempFilePath)
+		return fmt.Errorf("failed to encode png to temp cache file '%s': %w", tempFilePath, encodeErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(tempFilePath)
+		return fmt.Errorf("failed to close temp cache file '%s': %w", tempFilePath, closeErr)
+	}
+
+	err = os.Rename(tempFilePath, filePath)
+	if err != nil {
+
+		_ = os.Remove(tempFilePath)
+		return fmt.Errorf("failed to rename temp cache file '%s' to '%s': %w", tempFilePath, filePath, err)
+	}
+
+	return nil
 }
 
 func (r *tileMapRenderer) sendResult(result TileResult) {
@@ -543,13 +705,13 @@ func (r *tileMapRenderer) Objects() []fyne.CanvasObject {
 
 func (r *tileMapRenderer) Destroy() {}
 
-func latLonToTileXY(lat, lon float64, zoom int) (float64, float64) {
-	latRad := lat * math.Pi / 180.0
-	n := math.Pow(2.0, float64(zoom))
-	xtile := (lon + 180.0) / 360.0 * n
-	ytile := (1.0 - math.Log(math.Tan(latRad)+1.0/math.Cos(latRad))/math.Pi) / 2.0 * n
-	return xtile, ytile
-}
+// func latLonToTileXY(lat, lon float64, zoom int) (float64, float64) {
+// 	latRad := lat * math.Pi / 180.0
+// 	n := math.Pow(2.0, float64(zoom))
+// 	xtile := (lon + 180.0) / 360.0 * n
+// 	ytile := (1.0 - math.Log(math.Tan(latRad)+1.0/math.Cos(latRad))/math.Pi) / 2.0 * n
+// 	return xtile, ytile
+// }
 
 // =====================================================
 // Chart Widget Code
@@ -833,11 +995,11 @@ func createLoggedInScreen() fyne.CanvasObject {
 		layout.NewSpacer(),
 	)
 
-	mapStartZoom := 12
+	// mapStartZoom := 12
 	mapStartLat := gateways[0].lat
 	mapStartLon := gateways[0].lon
 
-	mapWidget := NewTileMapWidget(mapStartZoom, mapStartLat, mapStartLon, mainWindow)
+	mapWidget := NewTileMapWidget(minZoom, mapStartLat, mapStartLon, mainWindow)
 	mapWidget.AddMarkers(gatewayMarkers...)
 
 	rightSideContent := container.NewMax(mapWidget)
@@ -911,8 +1073,16 @@ func createConnectedScreen(gatewayName, gatewayRegion, deviceName string) fyne.C
 }
 
 func main() {
+	// precache()
+	// deleteCache()
+
 	a := app.New()
 	a.Settings().SetTheme(theme.DarkTheme())
+	err := initTileCache("cache/tiles")
+	if err != nil {
+		log.Printf("Warning: Failed to initialize tile cache: %v. Caching disabled.", err)
+		tileCachePath = ""
+	}
 	mainWindow = a.NewWindow("Fyne App with Map")
 	loginContent := createLoginScreen()
 	mainWindow.SetContent(loginContent)
@@ -920,4 +1090,284 @@ func main() {
 	mainWindow.CenterOnScreen()
 	mainWindow.ShowAndRun()
 	log.Println("Application exiting.")
+}
+
+func deleteCache() {
+	mainWindow.SetCloseIntercept(func() { /* ... cache removal logic ... */
+		log.Println("Window close intercepted, cleaning cache...")
+		if tileCachePath != "" {
+			log.Printf("Attempting to remove cache directory: %s", tileCachePath)
+			err := os.RemoveAll(tileCachePath)
+			if err != nil {
+				log.Printf("Error removing cache '%s': %v", tileCachePath, err)
+			} else {
+				log.Printf("Successfully removed cache directory: %s", tileCachePath)
+				parentDir := filepath.Dir(tileCachePath)
+				if filepath.Base(parentDir) == "cache" {
+					_ = os.Remove(parentDir)
+				}
+			}
+		}
+		mainWindow.Close()
+	})
+}
+
+func latLonToTileXY(lat, lon float64, zoom int) (float64, float64) {
+	latRad := lat * math.Pi / 180.0
+	n := math.Pow(2.0, float64(zoom))
+	xtile := (lon + 180.0) / 360.0 * n
+	ytile := (1.0 - math.Log(math.Tan(latRad)+1.0/math.Cos(latRad))/math.Pi) / 2.0 * n
+	return xtile, ytile
+}
+
+func getTileFilePath(coord TileCoord) string {
+	return filepath.Join(tileCachePath, fmt.Sprintf("%d", coord.Z), fmt.Sprintf("%d", coord.X), fmt.Sprintf("%d.png", coord.Y))
+}
+
+func writeRawTileToCache(filePath string, data []byte) error {
+	cacheWriteMutex.Lock()
+	defer cacheWriteMutex.Unlock()
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("mkdir '%s': %w", dir, err)
+	}
+	tempFile, err := os.CreateTemp(dir, "tile-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp '%s': %w", dir, err)
+	}
+	tempFilePath := tempFile.Name()
+	_, writeErr := tempFile.Write(data)
+	closeErr := tempFile.Close()
+	if writeErr != nil {
+		_ = os.Remove(tempFilePath)
+		return fmt.Errorf("write temp '%s': %w", tempFilePath, writeErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(tempFilePath)
+		return fmt.Errorf("close temp '%s': %w", tempFilePath, closeErr)
+	}
+	err = os.Rename(tempFilePath, filePath)
+	if err != nil {
+		_ = os.Remove(tempFilePath)
+		return fmt.Errorf("rename '%s'->'%s': %w", tempFilePath, filePath, err)
+	}
+	return nil
+}
+
+func downloadTile(coord TileCoord) ([]byte, error) {
+	url := fmt.Sprintf("https://api.mapbox.com/styles/v1/%s/%s/tiles/%d/%d/%d/%d?access_token=%s",
+		mapboxUsername, mapboxStyleID, mapTileSize, coord.Z, coord.X, coord.Y, mapboxAccessToken)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create req: %w", err)
+	}
+	req.Header.Set("User-Agent", yourUserAgent)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("404")
+	} // Treat 404 specifically maybe?
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("401 Unauthorized (check token)")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("http status %s", resp.Status)
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+
+	return bodyBytes, nil
+}
+
+func precacheLimitedTiles(minLat, maxLat, minLon, maxLon float64, targetZoom int, targetCount int, cacheDir string, concurrency int) error {
+	tileCachePath = cacheDir
+
+	log.Printf("Starting limited precache for Zoom %d (Target: %d tiles)", targetZoom, targetCount)
+	log.Printf("Area: Lat[%.4f, %.4f] Lon[%.4f, %.4f]", minLat, maxLat, minLon, maxLon)
+	log.Printf("Cache directory: %s", tileCachePath)
+	log.Printf("Concurrency limit: %d", concurrency)
+
+	if concurrency <= 0 {
+		concurrency = runtime.NumCPU()
+		log.Printf("Adjusted concurrency to %d", concurrency)
+	}
+	if targetCount <= 0 {
+		log.Println("Target count is zero or negative, nothing to do.")
+		return nil
+	}
+
+	log.Println("Calculating potential tiles...")
+	potentialCoords := []TileCoord{}
+	z := targetZoom
+	xTL, yTL := latLonToTileXY(maxLat, minLon, z)
+	xBR, yBR := latLonToTileXY(minLat, maxLon, z)
+	minX := int(math.Floor(xTL))
+	maxX := int(math.Floor(xBR))
+	minY := int(math.Floor(yTL))
+	maxY := int(math.Floor(yBR))
+	maxTileIndex := int(math.Pow(2, float64(z))) - 1
+
+	for x := minX; x <= maxX; x++ {
+		for y := minY; y <= maxY; y++ {
+			if y < 0 || y > maxTileIndex {
+				continue
+			}
+			potentialCoords = append(potentialCoords, TileCoord{Z: z, X: x, Y: y})
+		}
+	}
+	log.Printf("Found %d potential tiles in the area for zoom %d.", len(potentialCoords), targetZoom)
+	if len(potentialCoords) == 0 {
+		log.Println("No potential tiles found for the given area and zoom. Exiting.")
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, concurrency)
+	cancelChan := make(chan struct{})
+
+	var downloadedCount atomic.Int64
+	var skippedCount atomic.Int64
+	var errorCount atomic.Int64
+	startTime := time.Now()
+
+	dispatchedCount := 0
+	for _, coord := range potentialCoords {
+
+		if downloadedCount.Load() >= int64(targetCount) {
+			log.Printf("Target download count (%d) reached. Stopping dispatch.", targetCount)
+			break
+		}
+
+		select {
+		case <-cancelChan:
+			log.Println("Cancellation signal received. Stopping dispatch.")
+			break
+		default:
+
+		}
+
+		dispatchedCount++
+		wg.Add(1)
+		semaphore <- struct{}{}
+
+		go func(c TileCoord) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+
+			select {
+			case <-cancelChan:
+
+				return
+			default:
+
+			}
+
+			filePath := getTileFilePath(c)
+
+			if _, err := os.Stat(filePath); err == nil {
+				skippedCount.Add(1)
+				return
+			} else if !os.IsNotExist(err) {
+				log.Printf("Error stating cache file %s: %v", filePath, err)
+				errorCount.Add(1)
+				return
+			}
+
+			tileBytes, err := downloadTile(c)
+			if err != nil {
+				if err.Error() != "404" {
+					log.Printf("Error downloading tile %v: %v", c, err)
+					errorCount.Add(1)
+				} else {
+					skippedCount.Add(1)
+				}
+				return
+			}
+
+			err = writeRawTileToCache(filePath, tileBytes)
+			if err != nil {
+				log.Printf("Error writing tile %v to cache %s: %v", c, filePath, err)
+				errorCount.Add(1)
+				return
+			}
+
+			currentDownloads := downloadedCount.Add(1)
+
+			if currentDownloads == int64(targetCount) {
+				log.Printf("Target download count (%d) reached by goroutine for %v. Signaling cancellation.", targetCount, c)
+
+				select {
+				case <-cancelChan:
+				default:
+					close(cancelChan)
+				}
+
+			}
+
+		}(coord)
+	}
+
+	log.Printf("Finished dispatching %d checks/downloads. Waiting for completion...", dispatchedCount)
+	wg.Wait()
+	log.Println("-----------------------------------------")
+	log.Println("Limited Precaching Complete!")
+	log.Printf("Potential Tiles in Area: %d", len(potentialCoords))
+	log.Printf("Successfully Downloaded: %d (Target was %d)", downloadedCount.Load(), targetCount)
+	log.Printf("Already Cached (Skipped): %d", skippedCount.Load())
+	log.Printf("Errors Encountered: %d", errorCount.Load())
+	log.Printf("Total Time: %v", time.Since(startTime))
+	log.Println("-----------------------------------------")
+
+	return nil
+}
+
+func precache() {
+	minLat := -11.0
+	maxLat := 28.0
+	minLon := 92.0
+	maxLon := 141.0
+
+	targetCount := 500
+
+	concurrency := 8
+
+	cacheDir := "cache/tiles"
+	err := initTileCache(cacheDir)
+	if err != nil {
+		log.Fatalf("FATAL: Failed to initialize cache directory '%s': %v", cacheDir, err)
+	}
+
+	err = precacheLimitedTiles(minLat, maxLat, minLon, maxLon, minZoom, targetCount, tileCachePath, concurrency)
+	if err != nil {
+		log.Printf("Precaching finished with errors: %v", err)
+	} else {
+		log.Println("Precaching finished successfully.")
+	}
+}
+
+func initTileCache(relativeCacheDir string) error {
+	currentDir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("cwd: %w", err)
+	}
+	appCachePath := filepath.Join(currentDir, relativeCacheDir)
+	err = os.MkdirAll(appCachePath, 0755)
+	if err != nil {
+		if fileInfo, statErr := os.Stat(appCachePath); statErr == nil && !fileInfo.IsDir() {
+			return fmt.Errorf("path '%s' not dir", appCachePath)
+		}
+		return fmt.Errorf("mkdir '%s': %w", appCachePath, err)
+	}
+	tileCachePath = appCachePath
+	log.Println("Using relative tile cache directory:", tileCachePath)
+	return nil
 }
